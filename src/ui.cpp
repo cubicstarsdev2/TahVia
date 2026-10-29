@@ -409,8 +409,9 @@ void updateFrame(const ota::Info& o, const Hud& h) {
           &FreeSansBold18pt7b, TC_DATUM, tUpTitle.w / 2, 0);
 
   if (err) snprintf(b, sizeof(b), "%s", ota::errorText(o.err));
-  else     snprintf(b, sizeof(b), "v%u.%u  ->  v%u.%u", (unsigned)(FW_VERSION >> 8), (unsigned)(FW_VERSION & 0xFF),
-                    (unsigned)(o.version >> 8), (unsigned)(o.version & 0xFF));
+  else     snprintf(b, sizeof(b), "v%u.%u.%u  ->  v%u.%u.%u",
+                    (unsigned)FW_V_MAJOR(FW_VERSION), (unsigned)FW_V_MINOR(FW_VERSION), (unsigned)FW_V_PATCH(FW_VERSION),
+                    (unsigned)FW_V_MAJOR(o.version),  (unsigned)FW_V_MINOR(o.version),  (unsigned)FW_V_PATCH(o.version));
   setText(tUpVer, b, &FreeSans9pt7b, TC_DATUM, tUpVer.w / 2, 0);
 
   if (err) b[0] = 0; else snprintf(b, sizeof(b), "%d%%", pct);

@@ -3,7 +3,29 @@
 #include <stdint.h>
 
 #define PROTO_VERSION 1
-#define FW_VERSION    0x0100          // 1.0
+
+// ---- Firmware version --------------------------------------------------------------------------------
+// Single source of truth = the first "## x.y.z" line of README.md. tools/readme_version.py (PlatformIO
+// pre-script) reads it and passes -DFW_VERSION_MAJOR/MINOR/PATCH, so the firmware cannot drift from the README.
+// Wire format (HELLO_ACK / OTA_BEGIN, u16): (major << 8) | (minor << 4) | patch.  1.0.0 == 0x0100.
+#if !defined(FW_VERSION_MAJOR) || !defined(FW_VERSION_MINOR) || !defined(FW_VERSION_PATCH)
+  #warning "FW_VERSION_* not set (is tools/readme_version.py in extra_scripts?) - falling back to 1.0.0"
+  #undef  FW_VERSION_MAJOR
+  #undef  FW_VERSION_MINOR
+  #undef  FW_VERSION_PATCH
+  #define FW_VERSION_MAJOR 1
+  #define FW_VERSION_MINOR 0
+  #define FW_VERSION_PATCH 0
+#endif
+static_assert(FW_VERSION_MAJOR >= 0 && FW_VERSION_MAJOR <= 255 &&
+              FW_VERSION_MINOR >= 0 && FW_VERSION_MINOR <= 15 &&
+              FW_VERSION_PATCH >= 0 && FW_VERSION_PATCH <= 15,
+              "Version must fit the u16 code: major 0-255, minor 0-15, patch 0-15");
+#define FW_VERSION    ((FW_VERSION_MAJOR << 8) | (FW_VERSION_MINOR << 4) | FW_VERSION_PATCH)
+// Split a version code back into its parts (for display).
+#define FW_V_MAJOR(v) (((v) >> 8) & 0xFF)
+#define FW_V_MINOR(v) (((v) >> 4) & 0x0F)
+#define FW_V_PATCH(v) ((v) & 0x0F)
 
 namespace proto {
 enum Msg : uint8_t {

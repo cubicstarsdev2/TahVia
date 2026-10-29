@@ -2,6 +2,7 @@
 #include <NimBLEDevice.h>
 #include <esp_random.h>
 #include "config.h"
+#include "ota.h"
 
 using namespace proto;
 
@@ -76,6 +77,7 @@ inline void     wrU32(uint8_t* p, uint32_t v) { memcpy(p, &v, 4); }
 void BleNav::begin(NavModel* m) {
   m_ = m; g_self = this;
   q_ = xQueueCreate(BLE_RXQ_DEPTH, sizeof(RxMsg));
+  ota::setSender([](const uint8_t* m, size_t n) { g_self->send(m, n); });   // OTA_ACK goes out on the TX characteristic
 
   NimBLEDevice::init(DEVICE_NAME);
   NimBLEDevice::setMTU(BLE_MTU);
@@ -141,7 +143,7 @@ void BleNav::_onRx(const uint8_t* d, size_t n) {
 // ---- loop() side -----------------------------------------------------------------------------
 void BleNav::poll(uint32_t now) {
   if (!q_) return;
-  if (evtDisc_) { evtDisc_ = false; m_->resetSession(); }
+  if (evtDisc_) { evtDisc_ = false; ota::onDisconnect(); m_->resetSession(); }
   RxMsg msg;
   while (xQueueReceive(q_, &msg, 0) == pdTRUE) handle(msg.data, msg.len, now);
 
@@ -259,6 +261,12 @@ void BleNav::handle(const uint8_t* d, size_t n, uint32_t now) {
     case NAV_STATE:
       if (n < 2) { m.badMsgs++; break; }
       if (d[1] <= NAV_NO_GPS) m.navState = d[1];
+      break;
+
+    case OTA_BEGIN: case OTA_CHUNK: case OTA_END: case OTA_ABORT:
+      // With BLE_REQUIRE_PAIRING the RX characteristic only accepts writes on an encrypted link,
+      // so a message that got here is already secure.
+      ota::onMessage(d[0], d + 1, n - 1, true);
       break;
 
     default: break;                                     // unknown type: ignore

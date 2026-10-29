@@ -1,11 +1,10 @@
 #include "MonoTileRenderer.h"
 #include <stdlib.h>
+#include <math.h>
 
 namespace mtr {
 namespace {
 
-// Superficie 1 bpp (MSB primero) con origen en coordenadas de pantalla.
-// Sirve igual para el buffer base completo y para un tile de 32x32.
 struct Surface {
   uint8_t* data;
   int stride;
@@ -26,7 +25,6 @@ inline void putPixel(Surface& s, int x, int y, Mode m) {
   applyMask(s.data[y * s.stride + (x >> 3)], (uint8_t)(0x80 >> (x & 7)), m);
 }
 
-// Linea horizontal x0..x1 (inclusivo) trabajando por bytes.
 void hspan(Surface& s, int y, int x0, int x1, Mode m) {
   y -= s.oy;
   if ((unsigned)y >= (unsigned)s.h) return;
@@ -53,28 +51,28 @@ void fillRectS(Surface& s, int x, int y, int w, int h, Mode m) {
 
 void rectS(Surface& s, int x, int y, int w, int h, Mode m) {
   if (w <= 0 || h <= 0) return;
-  fillRectS(s, x, y, w, 1, m);                       // arriba
-  if (h > 1) fillRectS(s, x, y + h - 1, w, 1, m);    // abajo
+  fillRectS(s, x, y, w, 1, m);
+  if (h > 1) fillRectS(s, x, y + h - 1, w, 1, m);
   if (h > 2) {
-    fillRectS(s, x, y + 1, 1, h - 2, m);             // izquierda
-    if (w > 1) fillRectS(s, x + w - 1, y + 1, 1, h - 2, m);  // derecha
+    fillRectS(s, x, y + 1, 1, h - 2, m);
+    if (w > 1) fillRectS(s, x + w - 1, y + 1, 1, h - 2, m);
   }
 }
 
-int isqrt(int v) {
+inline int isqrt(int v) {
   if (v <= 0) return 0;
-  int r = 0;
+  int r = (int)sqrtf((float)v);
+  while (r * r > v) r--;
   while ((r + 1) * (r + 1) <= v) r++;
   return r;
 }
 
-// Disco relleno: para cada fila dy, semiancho = isqrt(r2 - dy^2).
 void fillDisc(Surface& s, int cx, int cy, int rr, int r2, Mode m) {
-  for (int dy = -rr; dy <= rr; dy++) {
-    int y = cy + dy;
-    if (y < s.oy || y >= s.oy + s.h) continue;
+  int d0 = s.oy - cy; if (d0 < -rr) d0 = -rr;           // solo filas visibles
+  int d1 = s.oy + s.h - 1 - cy; if (d1 > rr) d1 = rr;
+  for (int dy = d0; dy <= d1; dy++) {
     int hw = isqrt(r2 - dy * dy);
-    hspan(s, y, cx - hw, cx + hw, m);
+    hspan(s, cy + dy, cx - hw, cx + hw, m);
   }
 }
 
@@ -82,7 +80,6 @@ void circleS(Surface& s, int cx, int cy, int r, Mode m) {
   if (r <= 0) { putPixel(s, cx, cy, m); return; }
   int x = r, y = 0, d = 1 - r;
   while (x >= y) {
-    // Sin puntos duplicados (importante para XOR).
     putPixel(s, cx + x, cy + y, m);
     if (x)       putPixel(s, cx - x, cy + y, m);
     if (y)       putPixel(s, cx + x, cy - y, m);
@@ -99,25 +96,29 @@ void circleS(Surface& s, int cx, int cy, int r, Mode m) {
   }
 }
 
-// Bresenham. width > 1 estampa un disco en cada paso (usar SET/CLEAR; con XOR solo width 1).
-// Los semianchos del disco dependen solo del ancho: se calculan una vez por linea.
-// Ojo: itera toda la longitud de la linea; recorta/descarta fuera de pantalla antes de llamar.
+// Bresenham. width > 1 estampa un disco por paso (usar SET/CLEAR; con XOR solo width 1).
+// Los pasos fuera de la superficie (+margen) solo cuestan una comparacion.
 void lineS(Surface& s, int x0, int y0, int x1, int y1, int width, Mode m) {
   if (width > 16) width = 16;
   int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
   int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
   int err = dx + dy;
   const int rr = width / 2, r2 = (width * width) / 4;
+  const int pad = width > 1 ? rr : 0;
+  const int xl = s.ox - pad, xh = s.ox + s.w + pad;
+  const int yl = s.oy - pad, yh = s.oy + s.h + pad;
   int8_t hw[17];
   if (width > 1)
     for (int d = -rr; d <= rr; d++) hw[d + rr] = (int8_t)isqrt(r2 - d * d);
   for (;;) {
-    if (width <= 1) putPixel(s, x0, y0, m);
-    else {
-      for (int d = -rr; d <= rr; d++) {
-        int y = y0 + d;
-        if (y < s.oy || y >= s.oy + s.h) continue;
-        hspan(s, y, x0 - hw[d + rr], x0 + hw[d + rr], m);
+    if (x0 >= xl && x0 < xh && y0 >= yl && y0 < yh) {
+      if (width <= 1) putPixel(s, x0, y0, m);
+      else {
+        for (int d = -rr; d <= rr; d++) {
+          int y = y0 + d;
+          if (y < s.oy || y >= s.oy + s.h) continue;
+          hspan(s, y, x0 - hw[d + rr], x0 + hw[d + rr], m);
+        }
       }
     }
     if (x0 == x1 && y0 == y1) break;
@@ -127,12 +128,25 @@ void lineS(Surface& s, int x0, int y0, int x1, int y1, int width, Mode m) {
   }
 }
 
+// Bitmap recortado por columnas/filas; salta bytes fuente vacios.
 void bitmapS(Surface& s, int x, int y, int w, int h, const uint8_t* bits, Mode m) {
-  int stride = (w + 7) >> 3;
-  for (int r = 0; r < h; r++) {
-    if (y + r < s.oy || y + r >= s.oy + s.h) continue;
-    for (int c = 0; c < w; c++)
-      if ((bits[r * stride + (c >> 3)] >> (7 - (c & 7))) & 1) putPixel(s, x + c, y + r, m);
+  const int stride = (w + 7) >> 3;
+  int c0 = s.ox - x; if (c0 < 0) c0 = 0;
+  int c1 = s.ox + s.w - x; if (c1 > w) c1 = w;
+  if (c0 >= c1) return;
+  int r0 = s.oy - y; if (r0 < 0) r0 = 0;
+  int r1 = s.oy + s.h - y; if (r1 > h) r1 = h;
+  for (int r = r0; r < r1; r++) {
+    const uint8_t* row = bits + r * stride;
+    for (int cb = c0 >> 3; cb <= (c1 - 1) >> 3; cb++) {
+      uint8_t v = row[cb];
+      if (!v) continue;
+      for (int i = 0; i < 8; i++) {
+        int c = cb * 8 + i;
+        if (c < c0 || c >= c1 || !(v & (0x80 >> i))) continue;
+        putPixel(s, x + c, y + r, m);
+      }
+    }
   }
 }
 
@@ -148,7 +162,6 @@ void execCmd(Surface& s, const Cmd& c) {
   }
 }
 
-// ---- Constructores de comandos (calculan el bbox) ----
 Cmd blank(Op op, Mode m) {
   Cmd c; memset(&c, 0, sizeof(c));
   c.op = op; c.mode = m;
@@ -160,7 +173,7 @@ inline int mx(int a, int b) { return a > b ? a : b; }
 Cmd mkLine(int x0, int y0, int x1, int y1, int w, Mode m) {
   Cmd c = blank(OP_LINE, m);
   c.a = x0; c.b = y0; c.c = x1; c.d = y1; c.width = (uint8_t)w;
-  int pad = w > 1 ? w / 2 : 0;
+  int pad = w > 1 ? (w > 16 ? 16 : w) / 2 : 0;
   c.x0 = mn(x0, x1) - pad; c.y0 = mn(y0, y1) - pad;
   c.x1 = mx(x0, x1) + pad; c.y1 = mx(y0, y1) + pad;
   return c;
@@ -179,6 +192,8 @@ Cmd mkCircle(Op op, int cx, int cy, int r, Mode m) {
   return c;
 }
 
+inline bool sameCmd(const Cmd& a, const Cmd& b) { return memcmp(&a, &b, sizeof(Cmd)) == 0; }
+
 }  // namespace
 
 // ===================================================================
@@ -187,7 +202,6 @@ void Renderer::begin(const Display& d) {
   memset(base_, 0, sizeof(base_));
   nCur_ = nPrev_ = 0;
   overlayOpen_ = false;
-  outIdx_ = 0;
   scan_ = 0;
   buildLut();
   invalidateAll();
@@ -311,25 +325,24 @@ bool Renderer::ovBitmap(int x, int y, int w, int h, const uint8_t* bits, Mode m)
   return addCmd(c);
 }
 
-// Compara la lista nueva con la anterior y ensucia solo lo que cambio.
+// Compara con la lista anterior. Camino rapido: mismo comando en la misma posicion (O(n)
+// cuando el overlay es estable); solo los que no coinciden buscan en el resto de la lista.
 void Renderer::closeOverlay() {
-  auto has = [](const Cmd* list, int n, const Cmd& c) {
-    for (int i = 0; i < n; i++)
-      if (memcmp(&list[i], &c, sizeof(Cmd)) == 0) return true;
+  auto has = [](const Cmd* list, int n, int pos, const Cmd& c) {
+    if (pos < n && sameCmd(list[pos], c)) return true;
+    for (int i = 0; i < n; i++) if (sameCmd(list[i], c)) return true;
     return false;
   };
   for (int i = 0; i < nPrev_; i++)
-    if (!has(cur_, nCur_, prev_[i])) markDirtyRect(prev_[i].x0, prev_[i].y0, prev_[i].x1, prev_[i].y1);
+    if (!has(cur_, nCur_, i, prev_[i])) markDirtyRect(prev_[i].x0, prev_[i].y0, prev_[i].x1, prev_[i].y1);
   for (int i = 0; i < nCur_; i++)
-    if (!has(prev_, nPrev_, cur_[i])) markDirtyRect(cur_[i].x0, cur_[i].y0, cur_[i].x1, cur_[i].y1);
+    if (!has(prev_, nPrev_, i, cur_[i])) markDirtyRect(cur_[i].x0, cur_[i].y0, cur_[i].x1, cur_[i].y1);
   overlayOpen_ = false;
 }
 
 // ---- Render ----
 void Renderer::composeTile(int tx, int ty) {
   const int px = tx * TILE, py = ty * TILE;
-  constexpr int TB = TILE / 8;  // bytes por fila de tile
-
   for (int r = 0; r < TILE; r++)
     memcpy(tile_ + r * TB, base_ + (py + r) * STRIDE + (px >> 3), TB);
 
@@ -339,23 +352,6 @@ void Renderer::composeTile(int tx, int ty) {
     if (c.x1 < px || c.x0 >= px + TILE || c.y1 < py || c.y0 >= py + TILE) continue;
     execCmd(s, c);
   }
-}
-
-void Renderer::expandTile(uint16_t* out) {
-  constexpr int TB = TILE / 8;
-  for (int r = 0; r < TILE; r++)
-    for (int b = 0; b < TB; b++)
-      memcpy(out + r * TILE + b * 8, lut_[tile_[r * TB + b]], 8 * sizeof(uint16_t));
-}
-
-uint32_t Renderer::hashTile() const {
-  const uint32_t* p = (const uint32_t*)tile_;
-  uint32_t h = 2166136261u;
-  for (int i = 0; i < TILE * TILE / 32; i++) {
-    h = (h ^ p[i]) * 0x9E3779B1u;
-    h ^= h >> 15;
-  }
-  return h;
 }
 
 bool Renderer::tileHasOverlay(int tx, int ty) const {
@@ -368,67 +364,87 @@ bool Renderer::tileHasOverlay(int tx, int ty) const {
   return false;
 }
 
-// Compone el tile t (base + overlay), y si su contenido difiere de lo ya enviado lo manda a la pantalla.
-// Devuelve true si realmente se envio algo (los tiles que la pantalla ya muestra no cuentan).
-bool Renderer::sendTile(int t, bool& open) {
+// Compone el tile, lo compara con el shadow y envia SOLO el rectangulo que cambio
+// (filas r0..r1, bytes c0..c1 => ancho multiplo de 8). Devuelve pixeles enviados.
+int Renderer::sendTile(int t, bool& open) {
   const int tx = t % TILES_X, ty = t / TILES_X;
+  const int px = tx * TILE, py = ty * TILE;
+  const uint32_t t0 = MTR_NOW_US();
+  st_.processed++;
   composeTile(tx, ty);
-  const uint32_t hsh = hashTile();
-  if (sentOk_[t] && sent_[t] == hsh) return false;   // la pantalla ya muestra esto
-  sent_[t] = hsh;
-  sentOk_[t] = 1;
 
+  uint8_t* sh = shown_ + py * STRIDE + (px >> 3);
+  int r0 = -1, r1 = -1, c0 = TB, c1 = -1;
+
+  if (!shownOk_[t]) {
+    r0 = 0; r1 = TILE - 1; c0 = 0; c1 = TB - 1;
+  } else {
+    for (int r = 0; r < TILE; r++) {
+      const uint8_t* a = tile_ + r * TB;
+      const uint8_t* b = sh + r * STRIDE;
+      bool ch = false;
+      for (int k = 0; k < TB; k++)
+        if (a[k] != b[k]) { ch = true; if (k < c0) c0 = k; if (k > c1) c1 = k; }
+      if (ch) { if (r0 < 0) r0 = r; r1 = r; }
+    }
+    if (r1 < 0) { st_.composeUs += MTR_NOW_US() - t0; return 0; }   // la pantalla ya muestra esto
+  }
+
+  for (int r = r0; r <= r1; r++) memcpy(sh + r * STRIDE, tile_ + r * TB, TB);
+  shownOk_[t] = 1;
+
+  const int x = px + c0 * 8, y = py + r0;
+  const int w = (c1 - c0 + 1) * 8, h = r1 - r0 + 1;
+
+  const uint32_t t1 = MTR_NOW_US();
+  st_.composeUs += t1 - t0;
   if (!open) { if (disp_.begin) disp_.begin(disp_.ctx); open = true; }
   if (disp_.pushMono) {
-    disp_.pushMono(disp_.ctx, tx * TILE, ty * TILE, TILE, TILE, tile_);
+    disp_.pushMono(disp_.ctx, x, y, w, h, tile_ + r0 * TB + c0, TB);
   } else {
-    uint16_t* buf = out_[outIdx_];
-    expandTile(buf);                              // mientras el DMA anterior sigue en curso
-    if (disp_.wait) disp_.wait(disp_.ctx);        // el buffer de 2 envios atras ya esta libre
-    disp_.push(disp_.ctx, tx * TILE, ty * TILE, TILE, TILE, buf);
-    outIdx_ ^= 1;
+    for (int r = 0; r < h; r++)
+      for (int k = c0; k <= c1; k++)
+        memcpy(out_ + r * w + (k - c0) * 8, lut_[tile_[(r0 + r) * TB + k]], 8 * sizeof(uint16_t));
+    disp_.push(disp_.ctx, x, y, w, h, out_);
   }
-  return true;
+  st_.pushUs += MTR_NOW_US() - t1;
+  st_.sent++; st_.pixels += (uint32_t)(w * h);
+  return w * h;
 }
 
-// Envia los tiles sucios, con presupuesto opcional.
-//
-//  - Pasada 0: tiles sucios que toca el overlay (marcador, HUD) -> maximo 3/4 del presupuesto,
-//              para que el mapa no se muera de hambre.
-//  - Pasada 1: el resto de tiles sucios (mapa).
-//  - Los tiles se recorren en round-robin desde scan_, asi que ninguna zona queda siempre ultima.
-//  - Solo se limpia el bit sucio de los tiles que se procesaron; los que no entraron en el
-//    presupuesto siguen sucios y se componen con el contenido MAS RECIENTE en el proximo flush.
-//  - Los tiles descartados por hash (la pantalla ya los tenia) no consumen presupuesto.
-int Renderer::flush(int maxTiles) {
+// Pasada 0: tiles sucios que toca el overlay (max 3/4 de cada presupuesto). Pasada 1: el resto.
+// Round-robin desde scan_. Los tiles no procesados siguen sucios y se componen con el
+// contenido mas reciente. Los tiles sin cambios reales no consumen presupuesto de pixeles,
+// pero SI cuentan para maxTiles (cuestan CPU).
+int Renderer::flush(int maxPixels, int maxTiles) {
   if (overlayOpen_) closeOverlay();
+  st_ = Stats{};
 
-  const int ovLimit = maxTiles ? (maxTiles * 3 + 3) / 4 : 0;
-  int n = 0;
-  bool open = false;
-  bool exhausted = false;
+  const int ovLimit = maxPixels ? (maxPixels * 3 + 3) / 4 : 0;
+  const int ovTiles = maxTiles  ? (maxTiles * 3 + 3) / 4  : 0;
+  int n = 0, proc = 0;
+  bool open = false, exhausted = false;
 
   for (int pass = 0; pass < 2 && !exhausted; pass++) {
-    const int limit = (pass == 0) ? ovLimit : maxTiles;
+    const int limit  = (pass == 0) ? ovLimit : maxPixels;
+    const int tlimit = (pass == 0) ? ovTiles : maxTiles;
     for (int i = 0; i < TILES; i++) {
       int t = scan_ + i;
       if (t >= TILES) t -= TILES;
       if (!isDirty(t)) continue;
       if (pass == 0 && !tileHasOverlay(t % TILES_X, t / TILES_X)) continue;
 
-      if (limit && n >= limit) {
-        if (pass == 1) { scan_ = (uint16_t)t; exhausted = true; }   // retomar aca en el proximo frame
-        break;                                                      // pasada 0 llena -> seguir con el mapa
+      if ((limit && n >= limit) || (tlimit && proc >= tlimit)) {
+        if (pass == 1) { scan_ = (uint16_t)t; exhausted = true; }
+        break;
       }
       clearDirty(t);
-      if (sendTile(t, open)) n++;
+      proc++;
+      n += sendTile(t, open);
     }
   }
 
-  if (open) {
-    if (disp_.wait) disp_.wait(disp_.ctx);
-    if (disp_.end) disp_.end(disp_.ctx);
-  }
+  if (open && disp_.end) disp_.end(disp_.ctx);
   return n;
 }
 

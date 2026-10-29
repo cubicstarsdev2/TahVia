@@ -10,7 +10,7 @@
 // No build script needed: the string is parsed at compile time. Limits: major 0-255, minor 0-15, patch 0-15.
 // Can still be overridden from the build flags:  -DFW_VERSION_STRING=\"1.2.3\"
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "1.0.3"
+#define FW_VERSION_STRING "1.1.0"
 #endif
 
 // Wire format (HELLO_ACK / OTA_BEGIN, u16): (major << 8) | (minor << 4) | patch.  1.0.0 == 0x0100.

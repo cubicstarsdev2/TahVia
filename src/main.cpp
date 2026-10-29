@@ -29,14 +29,22 @@
 #include "ui.h"
 
 // ---- Tile budget (NAV screen only) ---------------------------------------------------------------
+// NOTE: rend.flush() budgets are in PIXELS (renderer v2), so the tile counts below are converted with
+//       TILE_PX. (Before, 24 was passed as 24 pixels = about one tile per frame.)
 // NAV_MAX_TILES  max tiles sent to the panel per frame in NAV. Tiles that don't fit stay dirty and
 //                are sent on the following frames (higher loop rate, possible tearing between frames).
 //                  0    = adaptive: the budget follows the measured SPI cost per tile
 //                  N>0  = fixed at N tiles per frame (the whole map is ~90 tiles, the screen is 150)
 //                Can be overridden from config.h or the build flags (-DNAV_MAX_TILES=24).
 // IDLE is always unlimited (it is mostly static).
+// Default = 24 tiles' worth of pixels at 32 px tiles, whatever MTR_TILE is (-DMTR_TILE=16 -> 96 tiles of 16x16).
 #ifndef NAV_MAX_TILES
-#define NAV_MAX_TILES          24
+#define NAV_MAX_TILES          (24 * 32 * 32 / (MTR_TILE * MTR_TILE))
+#endif
+// NAV_MAX_PROC   max tiles composed + compared per frame in NAV (changed or not). 0 = unlimited.
+//                Bounds CPU time when a map redraw dirties every tile; the rest stays dirty for the next frame.
+#ifndef NAV_MAX_PROC
+#define NAV_MAX_PROC           0
 #endif
 // Only used when NAV_MAX_TILES == 0 (adaptive):
 #ifndef NAV_FLUSH_TIME_SHARE
@@ -48,6 +56,8 @@
 #ifndef NAV_BUDGET_MAX
 #define NAV_BUDGET_MAX         mtr::TILES
 #endif
+
+static constexpr int TILE_PX = mtr::TILE * mtr::TILE;   // pixels in a full tile
 
 static TFT_eSPI      tft;
 static mtr::Renderer rend;
@@ -90,14 +100,14 @@ static void bootTo(int target) {
 }
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(9600);                  // 9600 baud made the once-per-second stats line block loop()
 
   tft.init();
   tft.setRotation(1);                    // 480x320 landscape
   tft.fillScreen(TFT_WHITE);
 
   mtr::Display d{};
-  d.ctx = &tft; d.begin = dBegin; d.push = dPush; d.wait = nullptr; d.end = dEnd;
+  d.ctx = &tft; d.begin = dBegin; d.push = dPush; d.end = dEnd;
   rend.begin(d);
   applyColors(false);
 
@@ -128,15 +138,16 @@ static uint32_t frameUs = FRAME_US_IDLE;
 static uint32_t nextFrameUs = 0, lastUs = 0;
 static uint32_t statT0 = 0, lastBattBle = 0;
 static int      statFrames = 0;
-static long     statTiles = 0;
+static long     statPx = 0;
+static uint32_t statComposeUs = 0, statPushUs = 0, statProc = 0, statSent = 0;
 static float    fps = 0;
-static int      avgTiles = 0;
+static int      avgKpx = 0;
 
 #if NAV_MAX_TILES > 0
-static int      tileBudget = NAV_MAX_TILES;     // fixed
+static int      pxBudget = NAV_MAX_TILES * TILE_PX;   // fixed (pixels)
 #else
-static int      tileBudget = 32;                // adaptive: starting value
-static float    usPerTile  = 700.f;             // moving average of the cost per sent tile (us)
+static int      pxBudget = 32 * TILE_PX;              // adaptive: starting value (pixels)
+static float    usPerPx  = 0.8f;                      // moving average of the cost per sent pixel (us)
 #endif
 
 void loop() {
@@ -178,40 +189,46 @@ void loop() {
   // ---- draw ----
   ui::Hud h;
   h.battPct = pct; h.connected = ble.connected(); h.pairing = ble.pairing();
-  h.passkey = ble.passkey(); h.showFps = model.cfg.showFps; h.fps = fps; h.tiles = avgTiles; h.nowMs = nowMs;
+  h.passkey = ble.passkey(); h.showFps = model.cfg.showFps; h.fps = fps; h.kpx = avgKpx; h.nowMs = nowMs;
 
   if      (screen == ui::SCR_NAV)    ui::navFrame(model, h);
   else if (screen == ui::SCR_UPDATE) ui::updateFrame(ota::info(), h);
   else                               ui::idleFrame(h);
 
-  const int budget = (screen == ui::SCR_NAV) ? tileBudget : 0;   // 0 = unlimited
+  const int budget = (screen == ui::SCR_NAV) ? pxBudget : 0;   // 0 = unlimited
   uint32_t f0 = micros();
-  int tiles = rend.flush(budget);
+  int px = rend.flush(budget, screen == ui::SCR_NAV ? NAV_MAX_PROC : 0);
+  { const mtr::Renderer::Stats& rs = rend.lastStats();
+    statComposeUs += rs.composeUs; statPushUs += rs.pushUs; statProc += rs.processed; statSent += rs.sent; }
   uint32_t flushUs = micros() - f0;
 
 #if NAV_MAX_TILES <= 0
   // Adaptive budget: make flushing fit in NAV_FLUSH_TIME_SHARE of the frame period.
-  if (screen == ui::SCR_NAV && tiles >= 4) {
-    usPerTile += 0.2f * ((float)flushUs / tiles - usPerTile);
-    if (usPerTile < 50.f) usPerTile = 50.f;
-    int b = (int)(frameUs * NAV_FLUSH_TIME_SHARE / usPerTile);
-    tileBudget = b < NAV_BUDGET_MIN ? NAV_BUDGET_MIN : (b > NAV_BUDGET_MAX ? NAV_BUDGET_MAX : b);
+  if (screen == ui::SCR_NAV && px >= 512) {
+    usPerPx += 0.2f * ((float)flushUs / px - usPerPx);
+    if (usPerPx < 0.05f) usPerPx = 0.05f;
+    int b = (int)(frameUs * NAV_FLUSH_TIME_SHARE / usPerPx);
+    const int lo = NAV_BUDGET_MIN * TILE_PX, hi = NAV_BUDGET_MAX * TILE_PX;
+    pxBudget = b < lo ? lo : (b > hi ? hi : b);
   }
 #else
   (void)flushUs;
 #endif
 
   // ---- stats (once per second) ----
-  statFrames++; statTiles += tiles;
+  statFrames++; statPx += px;
   uint32_t el = millis() - statT0;
   if (el >= 1000) {
     fps = statFrames * 1000.0f / el;                         // NOTE: loop rate, not panel refresh rate
-    avgTiles = (int)(statTiles / statFrames);
-    Serial.printf("%s %.0f fps %d tiles  budget=%d pending=%d  bad=%lu dropped=%lu free=%u\n",
-                  screen == ui::SCR_NAV ? "NAV" : "IDLE", fps, avgTiles,
-                  tileBudget, rend.dirtyCount(),
+    avgKpx = (int)(statPx / statFrames / 1000);
+    Serial.printf("%s %.0f fps %d kpx  budget=%d kpx pending=%d tiles  proc=%lu sent=%lu compose=%luus push=%luus (per frame)  bad=%lu dropped=%lu free=%u\n",
+                  screen == ui::SCR_NAV ? "NAV" : "IDLE", fps, avgKpx,
+                  pxBudget / 1000, rend.dirtyCount(),
+                  (unsigned long)(statProc / statFrames), (unsigned long)(statSent / statFrames),
+                  (unsigned long)(statComposeUs / statFrames), (unsigned long)(statPushUs / statFrames),
                   (unsigned long)model.badMsgs, (unsigned long)model.droppedMsgs,
                   model.active->freeSlots());
-    statT0 = millis(); statFrames = 0; statTiles = 0;
+    statT0 = millis(); statFrames = 0; statPx = 0;
+    statComposeUs = statPushUs = statProc = statSent = 0;
   }
 }

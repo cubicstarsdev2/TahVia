@@ -17,7 +17,7 @@ struct Hud {                 // per-frame data owned by main
   bool     showFps;          // CONFIG flag bit2
   uint32_t passkey;
   float    fps;
-  int      tiles;
+  int      kpx;              // average kilo-pixels sent to the panel per frame
   uint32_t nowMs;
 };
 

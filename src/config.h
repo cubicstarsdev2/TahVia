@@ -18,7 +18,7 @@
 #define SCREEN_H             320
 
 // ---- Timing -----------------------------------------------------------------
-#define FRAME_US_NAV         (1000000UL / 30)
-#define FRAME_US_IDLE        (1000000UL / 30)
+#define FRAME_US_NAV         (1000000UL / 60)
+#define FRAME_US_IDLE        (1000000UL / 60)
 #define POSE_TIMEOUT_MS      3000
 #define BOOT_BAR_RATE        80.0f     // percent per second (bar animation speed)

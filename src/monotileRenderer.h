@@ -1,21 +1,16 @@
-// MonoTileRenderer - renderizador 1 bpp por tiles con seguimiento de tiles sucios.
+// MonoTileRenderer v2 - renderizador 1 bpp por tiles, pensado para SPI SIN DMA.
 //
-// Dos capas, ambas en 1 bit por pixel (1 = primer plano, 0 = fondo):
+// Cuello de botella sin DMA: la CPU espera cada byte enviado. Por eso v2 minimiza PIXELES enviados:
+//   - Se mantiene un "shadow" 1 bpp de lo que la pantalla muestra (shown_).
+//   - Cada tile sucio se compone y se compara con el shadow; solo se envia el rectangulo
+//     minimo (alineado a 8 px en x) que cambio. Tiles identicos no cuestan nada.
+//   - El presupuesto de flush() es en pixeles, no en tiles.
 //
-//   BASE     Buffer persistente de 480x320 (19.200 bytes). Aqui se dibuja el mapa.
-//            Las funciones base*() dibujan de inmediato y marcan tiles sucios.
+// Capas (1 bit por pixel, 1 = primer plano):
+//   BASE     buffer persistente (mapa). base*() dibuja y marca tiles sucios.
+//   OVERLAY  lista de comandos que se re-emite cada frame (overlayBegin() + ov*()).
 //
-//   OVERLAY  Lista de comandos (marcador, flecha de giro, HUD). Se re-emite en cada
-//            frame con overlayBegin() + ov*(). El renderizador compara con el frame
-//            anterior y solo ensucia los tiles de los comandos que cambiaron.
-//
-// flush(maxTiles): por cada tile sucio copia el tile de BASE, le aplica los comandos de
-// OVERLAY que lo tocan, expande 1 bit -> RGB565 (2 colores) y lo envia a la pantalla.
-// Con maxTiles > 0 envia como maximo esa cantidad de tiles por llamada; los demas siguen
-// marcados como sucios y se envian en las llamadas siguientes (siempre con el contenido
-// mas reciente de BASE + OVERLAY). Los tiles que tocan el overlay tienen prioridad.
-//
-// No depende de TFT_eSPI: el envio a pantalla es un callback (ver struct Display).
+// Memoria: base_ + shown_ = 2 x 19.200 bytes (480x320).
 #pragma once
 #include <stdint.h>
 #include <string.h>
@@ -27,61 +22,73 @@
 #define MTR_HEIGHT 320
 #endif
 #ifndef MTR_MAX_CMDS
-#define MTR_MAX_CMDS 96       // comandos de overlay por frame (x2 listas)
+#define MTR_MAX_CMDS 96
+#endif
+#ifndef MTR_TILE
+#define MTR_TILE 8           // tile side in px: multiple of 8 that divides the screen (8, 16, 32, 40...)
+#endif                        //   small = tighter changed-rectangle (fewer unchanged pixels sent), more tiles to scan
+                              //   big   = less per-tile overhead (window setup), more unchanged pixels inside the rectangle
+#ifndef MTR_STATS
+#define MTR_STATS 1           // measure compose vs push time per flush (needs Arduino micros(); otherwise reports 0)
+#endif
+#if MTR_STATS && defined(ARDUINO)
+  #include <Arduino.h>
+  #define MTR_NOW_US() ((uint32_t)micros())
+#else
+  #define MTR_NOW_US() ((uint32_t)0)
 #endif
 #ifndef MTR_SWAP_BYTES
-#define MTR_SWAP_BYTES 1      // 1 = RGB565 con bytes intercambiados (pushImageDMA con swapBytes=false)
+#define MTR_SWAP_BYTES 1      // RGB565 con bytes intercambiados (solo para el camino push)
 #endif
 
 namespace mtr {
 
-constexpr int TILE    = 32;                    // 32 px = 4 bytes por fila de tile
+constexpr int TILE    = MTR_TILE;
+constexpr int TB      = TILE / 8;               // bytes por fila de tile
 constexpr int TILES_X = MTR_WIDTH / TILE;
 constexpr int TILES_Y = MTR_HEIGHT / TILE;
-constexpr int TILES   = TILES_X * TILES_Y;     // 150 con 480x320
-constexpr int STRIDE  = MTR_WIDTH / 8;         // bytes por fila del buffer base
+constexpr int TILES   = TILES_X * TILES_Y;
+constexpr int STRIDE  = MTR_WIDTH / 8;
 
+static_assert(MTR_TILE % 8 == 0, "MTR_TILE must be a multiple of 8 (x is sent in whole bytes)");
 static_assert(MTR_WIDTH % TILE == 0 && MTR_HEIGHT % TILE == 0,
               "El tamano de pantalla debe ser multiplo de TILE");
 
 enum Mode : uint8_t { CLEAR = 0, SET = 1, XOR = 2 };
-
 enum Op : uint8_t { OP_LINE, OP_FILL_RECT, OP_RECT, OP_CIRCLE, OP_FILL_CIRCLE, OP_BITMAP };
 
-// Comando de dibujo. Se construye siempre con memset(0) previo para poder
-// compararlo con memcmp entre frames.
 struct Cmd {
   uint8_t  op, mode, width, _pad;
-  int16_t  a, b, c, d;        // argumentos segun op (ver abajo)
-  int16_t  x0, y0, x1, y1;    // bounding box inclusivo en pantalla
-  const uint8_t* bmp;         // solo OP_BITMAP
+  int16_t  a, b, c, d;
+  int16_t  x0, y0, x1, y1;    // bbox inclusivo
+  const uint8_t* bmp;
 };
-// OP_LINE: a,b=x0,y0  c,d=x1,y1  width | OP_FILL_RECT/OP_RECT: a,b=x,y c,d=w,h
-// OP_CIRCLE/OP_FILL_CIRCLE: a,b=cx,cy c=r | OP_BITMAP: a,b=x,y c,d=w,h bmp (1bpp MSB primero)
 
 // Callbacks hacia la pantalla. Hace falta `push` o `pushMono` (si hay pushMono se usa ese).
 struct Display {
   void* ctx;
   void (*begin)(void* ctx);                                                 // ej. tft.startWrite()
-  void (*push)(void* ctx, int x, int y, int w, int h, const uint16_t* px);  // ej. tft.pushImageDMA(...)
-  void (*wait)(void* ctx);                                                  // ej. tft.dmaWait()
+  void (*push)(void* ctx, int x, int y, int w, int h, const uint16_t* px);  // RGB565 (con swap segun MTR_SWAP_BYTES)
   void (*end)(void* ctx);                                                   // ej. tft.endWrite()
-  // Alternativa a push: recibe el tile en 1 bpp (MSB primero, w/8 bytes por fila) y el callback lo
-  // expande al formato nativo de la pantalla (ej. RGB666 para ILI9488 por SPI). Ahorra la expansion a RGB565.
-  void (*pushMono)(void* ctx, int x, int y, int w, int h, const uint8_t* bits);
+  // RECOMENDADO sin DMA: recibe el rectangulo en 1 bpp (MSB primero). La fila r empieza en
+  // bits + r*stride y tiene w/8 bytes utiles. El callback expande al formato nativo con una
+  // LUT propia (ej. 3 bytes/pixel para ILI9488) y escribe directo al SPI.
+  void (*pushMono)(void* ctx, int x, int y, int w, int h, const uint8_t* bits, int stride);
 };
 
 class Renderer {
  public:
   void begin(const Display& d);
-  void setColors(uint16_t fg, uint16_t bg);   // RGB565 normal; el swap de bytes lo hace la libreria
-  void invalidateAll();                       // marca todos los tiles como sucios
-  void forceResend() { memset(sentOk_, 0, sizeof(sentOk_)); }  // olvida lo enviado: llamar si algo mas dibujo en la pantalla
+  void setColors(uint16_t fg, uint16_t bg);   // RGB565 normal
+  uint16_t fg() const { return fg_; }
+  uint16_t bg() const { return bg_; }
+  void invalidateAll();
+  void forceResend() { memset(shownOk_, 0, sizeof(shownOk_)); }  // llamar si algo mas dibujo en la pantalla
 
-  // ---- BASE (inmediato, persistente) ----
+  // ---- BASE ----
   void baseClear(Mode m = CLEAR);
   void baseLine(int x0, int y0, int x1, int y1, int width = 1, Mode m = SET);
-  void basePolyline(const int16_t* xy, int nPoints, int width = 1, Mode m = SET);  // xy = x0,y0,x1,y1...
+  void basePolyline(const int16_t* xy, int nPoints, int width = 1, Mode m = SET);
   void baseFillRect(int x, int y, int w, int h, Mode m = SET);
   void baseRect(int x, int y, int w, int h, Mode m = SET);
   void baseCircle(int cx, int cy, int r, Mode m = SET);
@@ -89,49 +96,60 @@ class Renderer {
   void baseBitmap(int x, int y, int w, int h, const uint8_t* bits, Mode m = SET);
   bool basePixel(int x, int y) const;
 
-  // ---- OVERLAY (lista de comandos, se re-emite cada frame) ----
-  void overlayBegin();                        // descarta la lista y guarda la anterior para comparar
+  // ---- OVERLAY ----
+  void overlayBegin();
   bool ovLine(int x0, int y0, int x1, int y1, int width = 1, Mode m = SET);
   bool ovFillRect(int x, int y, int w, int h, Mode m = SET);
   bool ovRect(int x, int y, int w, int h, Mode m = SET);
   bool ovCircle(int cx, int cy, int r, Mode m = SET);
   bool ovFillCircle(int cx, int cy, int r, Mode m = SET);
-  bool ovBitmap(int x, int y, int w, int h, const uint8_t* bits, Mode m = SET);  // `bits` debe seguir vivo (flash)
+  bool ovBitmap(int x, int y, int w, int h, const uint8_t* bits, Mode m = SET);
 
   // ---- Salida ----
-  // Envia tiles sucios. maxTiles = 0 -> sin limite (pantalla completa, ej. boot).
-  // maxTiles > 0 -> como maximo esa cantidad de tiles *enviados* por llamada; el resto queda
-  // pendiente (sigue sucio). Devuelve cuantos tiles se enviaron.
-  int  flush(int maxTiles = 0);
-  int  dirtyCount() const;                    // tiles todavia pendientes (sucios)
-  void markDirtyRect(int x0, int y0, int x1, int y1);   // inclusivo
+  // maxPixels = 0 -> sin limite. Si no, deja de empezar tiles nuevos al superar el presupuesto
+  // (puede pasarse por un tile como maximo); el resto sigue sucio para el proximo flush.
+  // maxTiles  = 0 -> sin limite. Si no, procesa (compone + compara) como mucho esos tiles por flush,
+  // cambien o no; acota el tiempo de CPU cuando un redibujado del mapa ensucia todos los tiles.
+  // Los tiles que tocan el overlay tienen prioridad (hasta 3/4 de cada presupuesto).
+  // Devuelve PIXELES enviados.
+  int  flush(int maxPixels = 0, int maxTiles = 0);
+
+  // Resultado del ultimo flush (tiempos solo con MTR_STATS y Arduino).
+  struct Stats {
+    uint16_t processed;   // tiles compuestos y comparados
+    uint16_t sent;        // de ellos, los que realmente cambiaron y se enviaron
+    uint32_t pixels;      // pixeles enviados
+    uint32_t composeUs;   // componer + comparar con shown_
+    uint32_t pushUs;      // callback de pantalla (SPI)
+  };
+  const Stats& lastStats() const { return st_; }
+  int  dirtyCount() const;
+  void markDirtyRect(int x0, int y0, int x1, int y1);
 
  private:
   bool addCmd(const Cmd& c);
   void closeOverlay();
-  void composeTile(int tx, int ty);           // base + overlay -> tile_ (1 bpp)
-  void expandTile(uint16_t* out);             // tile_ -> RGB565
-  uint32_t hashTile() const;
+  void composeTile(int tx, int ty);
+  int  sendTile(int t, bool& open);            // devuelve pixeles enviados (0 = nada cambio)
   void buildLut();
   bool isDirty(int t) const { return dirty_[t >> 5] & (1u << (t & 31)); }
   void clearDirty(int t) { dirty_[t >> 5] &= ~(1u << (t & 31)); }
-  bool tileHasOverlay(int tx, int ty) const;  // algun comando del overlay actual toca este tile
-  bool sendTile(int t, bool& open);           // compone + hash + envia; false si la pantalla ya lo mostraba
+  bool tileHasOverlay(int tx, int ty) const;
 
   Display  disp_{};
   uint16_t fg_ = 0x0000, bg_ = 0xFFFF;
   uint8_t  base_[MTR_HEIGHT * STRIDE];
+  uint8_t  shown_[MTR_HEIGHT * STRIDE];        // lo que la pantalla muestra (1 bpp)
+  uint8_t  shownOk_[TILES];                    // 1 si shown_ de ese tile es valido
   uint32_t dirty_[(TILES + 31) / 32];
   Cmd      cur_[MTR_MAX_CMDS], prev_[MTR_MAX_CMDS];
   uint16_t nCur_ = 0, nPrev_ = 0;
   bool     overlayOpen_ = false;
-  alignas(4) uint8_t tile_[TILE * TILE / 8];
-  uint32_t sent_[TILES];                      // hash del ultimo contenido enviado a cada tile
-  uint8_t  sentOk_[TILES];                    // 1 si sent_[t] es valido
-  uint16_t out_[2][TILE * TILE];
-  uint16_t lut_[256][8];                      // byte de 8 pixeles -> 8 RGB565
-  uint8_t  outIdx_ = 0;
-  uint16_t scan_ = 0;                         // donde empieza el barrido round-robin del proximo flush
+  alignas(4) uint8_t tile_[TILE * TB];
+  uint16_t out_[TILE * TILE];                  // solo camino push
+  uint16_t lut_[256][8];
+  uint16_t scan_ = 0;
+  Stats    st_{};
 };
 
 }  // namespace mtr

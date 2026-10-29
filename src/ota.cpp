@@ -17,13 +17,20 @@ char     md5hex_[33] = {0};
 uint8_t  sinceAck_ = 0;          // good chunks since the last OTA_ACK
 bool     gapSent_  = false;      // a GAP ack is already out for the current gap (no spamming)
 uint32_t lastRxMs_ = 0;
+uint32_t lastAckMs_ = 0;         // last OTA_ACK sent (any kind)
+uint32_t lastGapMs_ = 0;         // last GAP ack sent
 uint32_t stateMs_  = 0;          // when ERROR / DONE was entered
+
+// ms elapsed since `t`, clamped to 0. `now` is sampled at the top of loop() and the stamps below are taken with
+// millis() while ble.poll() runs, i.e. they can be NEWER than `now`: a plain `now - t` would wrap to ~4e9.
+inline uint32_t since(uint32_t now, uint32_t t) { return (int32_t)(now - t) > 0 ? now - t : 0; }
 
 inline uint32_t rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }   // little-endian host
 inline uint16_t rd16(const uint8_t* p) { uint16_t v; memcpy(&v, p, 2); return v; }
 
 // OTA_ACK: [0x83][status][state][next u32][window][ackEvery]
 void sendAck(uint8_t status) {
+  lastAckMs_ = millis();
   if (!sendFn) return;
   uint8_t m[9];
   m[0] = OTA_ACK; m[1] = status; m[2] = in.state;
@@ -35,6 +42,7 @@ void sendAck(uint8_t status) {
 // Transfer failed: drop the partial image, show the error screen, tell the phone.
 void enterError(uint8_t err, bool notify) {
   Update.abort();
+  Serial.printf("OTA error %u at %u/%u\n", (unsigned)err, (unsigned)next_, (unsigned)size_);
   in.state = OTA_ERROR; in.err = err;
   stateMs_ = millis();
   if (notify) sendAck(err);
@@ -87,8 +95,9 @@ void doChunk(const uint8_t* p, size_t len) {
   const size_t   n = len - 4;
   lastRxMs_ = millis();
 
-  if (off != next_) {                                         // lost / duplicated chunk: tell the phone once
-    if (!gapSent_) { gapSent_ = true; sendAck(OTA_E_GAP); }
+  if (off != next_) {                                         // lost / duplicated chunk: tell the phone
+    const uint32_t t = millis();                              // (repeated every 500 ms: a single lost GAP ack must not hang the transfer)
+    if (!gapSent_ || t - lastGapMs_ > 500) { gapSent_ = true; lastGapMs_ = t; sendAck(OTA_E_GAP); }
     return;
   }
   if (n > size_ - next_) { enterError(OTA_E_SIZE, true); return; }
@@ -143,13 +152,18 @@ void onDisconnect() {
 void update(uint32_t now) {
   switch (in.state) {
     case OTA_RECEIVING:
-      if (now - lastRxMs_ > OTA_IDLE_TIMEOUT_MS) enterError(OTA_E_TIMEOUT, true);
+      if (since(now, lastRxMs_) > OTA_IDLE_TIMEOUT_MS) enterError(OTA_E_TIMEOUT, true);
+      else if (since(now, lastRxMs_) > 1000 && since(now, lastAckMs_) > 1000) {
+        // Nothing arrived for a second: re-announce where we are, so a lost ACK / GAP ack cannot deadlock the phone.
+        gapSent_ = false;
+        sendAck(OTA_OK);                                      // carries next_ = resume point
+      }
       break;
     case OTA_ERROR:
-      if (now - stateMs_ > OTA_ERROR_SHOW_MS) { in.state = OTA_IDLE; in.err = OTA_OK; }
+      if (since(now, stateMs_) > OTA_ERROR_SHOW_MS) { in.state = OTA_IDLE; in.err = OTA_OK; }
       break;
     case OTA_DONE:
-      if (now - stateMs_ > OTA_REBOOT_DELAY_MS) ESP.restart();
+      if (since(now, stateMs_) > OTA_REBOOT_DELAY_MS) ESP.restart();
       break;
   }
 }

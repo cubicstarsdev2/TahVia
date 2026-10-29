@@ -15,7 +15,7 @@
   #undef  FW_VERSION_PATCH
   #define FW_VERSION_MAJOR 1
   #define FW_VERSION_MINOR 0
-  #define FW_VERSION_PATCH 0
+  #define FW_VERSION_PATCH 1
 #endif
 static_assert(FW_VERSION_MAJOR >= 0 && FW_VERSION_MAJOR <= 255 &&
               FW_VERSION_MINOR >= 0 && FW_VERSION_MINOR <= 15 &&
